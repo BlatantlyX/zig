@@ -3134,7 +3134,9 @@ fn buildOutputType(
         break :l global_cache_directory;
     };
 
-    var thread_pool = try std.zig.initThreadPool(gpa, .{
+    var thread_pool: std.Thread.Pool = undefined;
+    try std.zig.initThreadPool(&thread_pool, .{
+        .allocator = gpa,
         .cache_directory = local_cache_directory,
     });
     defer thread_pool.deinit();
@@ -4248,6 +4250,7 @@ fn runOrTest(
         child.stdin_behavior = .Inherit;
         child.stdout_behavior = .Inherit;
         child.stderr_behavior = .Inherit;
+        child.thread_pool = comp.thread_pool;
 
         // Here we release all the locks associated with the Compilation so
         // that whatever this child process wants to do won't deadlock.
@@ -4393,6 +4396,7 @@ fn runOrTestHotSwap(
             child.stdin_behavior = .Inherit;
             child.stdout_behavior = .Inherit;
             child.stderr_behavior = .Inherit;
+            child.thread_pool = comp.thread_pool;
 
             try child.spawn();
 
@@ -4894,7 +4898,9 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
 
     child_argv.items[argv_index_cache_dir] = local_cache_directory.path orelse cwd_path;
 
-    var thread_pool = try std.zig.initThreadPool(gpa, .{
+    var thread_pool: std.Thread.Pool = undefined;
+    try std.zig.initThreadPool(&thread_pool, .{
+        .allocator = gpa,
         .cache_directory = local_cache_directory,
     });
     defer thread_pool.deinit();
@@ -5183,6 +5189,7 @@ fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
             child.stdin_behavior = .Inherit;
             child.stdout_behavior = .Inherit;
             child.stderr_behavior = .Inherit;
+            child.thread_pool = &thread_pool;
 
             const term = t: {
                 std.debug.lockStdErr();
@@ -5329,7 +5336,9 @@ fn jitCmd(
     };
     defer global_cache_directory.handle.close();
 
-    var thread_pool = try std.zig.initThreadPool(gpa, .{
+    var thread_pool: std.Thread.Pool = undefined;
+    try std.zig.initThreadPool(&thread_pool, .{
+        .allocator = gpa,
         .cache_directory = global_cache_directory,
     });
     defer thread_pool.deinit();
@@ -5472,6 +5481,7 @@ fn jitCmd(
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = if (options.capture == null) .Inherit else .Pipe;
     child.stderr_behavior = .Inherit;
+    child.thread_pool = &thread_pool;
 
     try child.spawn();
 
@@ -6895,7 +6905,9 @@ fn cmdFetch(
     };
     defer global_cache_directory.handle.close();
 
-    var thread_pool = try std.zig.initThreadPool(gpa, .{
+    var thread_pool: std.Thread.Pool = undefined;
+    try std.zig.initThreadPool(&thread_pool, .{
+        .allocator = gpa,
         .cache_directory = global_cache_directory,
     });
     defer thread_pool.deinit();
