@@ -125,10 +125,68 @@ pub fn linkmap_iterator(phdrs: []elf.Phdr) error{InvalidExe}!LinkMap.Iterator {
 pub const ElfDynLib = struct {
     strings: [*:0]u8,
     syms: [*]elf.Sym,
-    hashtab: [*]posix.Elf_Symndx,
+    hashtab: HashTab,
     versym: ?[*]u16,
     verdef: ?*elf.Verdef,
     memory: []align(mem.page_size) u8,
+
+    const HashTab = union(enum) {
+        ELF: ElfHashTab,
+        GNU: GnuHashTab,
+    };
+
+    const ElfHashTab = struct {
+        buckets: []u32,
+        chains: []u32,
+
+        fn fromPtr(ptr: usize) @This() {
+            const place: [*]u32 = @ptrFromInt(ptr);
+            const bucket_size = place[0];
+            const chain_size = place[1];
+            return .{
+                .buckets = place[2 .. 2 + bucket_size],
+                .chains = place[2 + bucket_size .. 2 + bucket_size + chain_size],
+            };
+        }
+    };
+
+    const GnuHashTab = struct {
+        sym_offset: u32,
+        bloom_shift: u32,
+        bloom: switch (@sizeOf(usize)) {
+            4 => []u32,
+            8 => []u64,
+            else => @compileError("expected 32 or 64 bit"),
+        },
+        buckets: []u32,
+        chain: [*]u32,
+
+        fn fromPtr(ptr: usize) @This() {
+            const place: [*]u32 = @ptrFromInt(ptr);
+            const buckets_size = place[0];
+            const sym_offset = place[1];
+            const bloom_size = place[2];
+            const bloom_shift = place[3];
+            const bloom = switch (@sizeOf(usize)) {
+                4 => place[4 .. 4 + bloom_size],
+                8 => @as([*]u64, @ptrFromInt(ptr))[2 .. 2 + bloom_size],
+                else => @compileError("expected either 32 bit or 64 bit"),
+            };
+            const bucket_offset = switch (@sizeOf(usize)) {
+                4 => 4 + bloom_size,
+                8 => 4 + (bloom_size * 2),
+                else => @compileError("expected either 32 bit or 64 bit"),
+            };
+
+            return .{
+                .sym_offset = sym_offset,
+                .bloom_shift = bloom_shift,
+                .bloom = bloom,
+                .buckets = place[bucket_offset .. bucket_offset + buckets_size],
+                .chain = place[bucket_offset + buckets_size ..],
+            };
+        }
+    };
 
     pub const Error = error{
         FileTooBig,
@@ -247,7 +305,8 @@ pub const ElfDynLib = struct {
 
         var maybe_strings: ?[*:0]u8 = null;
         var maybe_syms: ?[*]elf.Sym = null;
-        var maybe_hashtab: ?[*]posix.Elf_Symndx = null;
+        var maybe_hashtab: ?ElfHashTab = null;
+        var maybe_gnu_hashtab: ?GnuHashTab = null;
         var maybe_versym: ?[*]u16 = null;
         var maybe_verdef: ?*elf.Verdef = null;
 
@@ -258,7 +317,8 @@ pub const ElfDynLib = struct {
                 switch (dynv[i]) {
                     elf.DT_STRTAB => maybe_strings = @as([*:0]u8, @ptrFromInt(p)),
                     elf.DT_SYMTAB => maybe_syms = @as([*]elf.Sym, @ptrFromInt(p)),
-                    elf.DT_HASH => maybe_hashtab = @as([*]posix.Elf_Symndx, @ptrFromInt(p)),
+                    elf.DT_HASH => maybe_hashtab = ElfHashTab.fromPtr(p),
+                    elf.DT_GNU_HASH => maybe_gnu_hashtab = GnuHashTab.fromPtr(p),
                     elf.DT_VERSYM => maybe_versym = @as([*]u16, @ptrFromInt(p)),
                     elf.DT_VERDEF => maybe_verdef = @as(*elf.Verdef, @ptrFromInt(p)),
                     else => {},
@@ -266,11 +326,18 @@ pub const ElfDynLib = struct {
             }
         }
 
+        const hashtab: HashTab = if (maybe_gnu_hashtab) |tab|
+            .{ .GNU = tab }
+        else if (maybe_hashtab) |tab|
+            .{ .ELF = tab }
+        else
+            return error.ElfHashTableNotFound;
+
         return .{
             .memory = all_loaded_mem,
             .strings = maybe_strings orelse return error.ElfStringSectionNotFound,
             .syms = maybe_syms orelse return error.ElfSymSectionNotFound,
-            .hashtab = maybe_hashtab orelse return error.ElfHashTableNotFound,
+            .hashtab = hashtab,
             .versym = maybe_versym,
             .verdef = maybe_verdef,
         };
@@ -295,6 +362,14 @@ pub const ElfDynLib = struct {
         }
     }
 
+    fn elfGnuHash(name: []const u8) u32 {
+        var hash: u32 = 5381;
+        for (name) |c| {
+            hash = @addWithOverflow(@addWithOverflow(@shlWithOverflow(hash, 5)[0], hash)[0], c)[0];
+        }
+        return hash;
+    }
+
     /// ElfDynLib specific
     /// Returns the address of the symbol
     pub fn lookupAddress(self: *const ElfDynLib, vername: []const u8, name: []const u8) ?usize {
@@ -303,20 +378,46 @@ pub const ElfDynLib = struct {
         const OK_TYPES = (1 << elf.STT_NOTYPE | 1 << elf.STT_OBJECT | 1 << elf.STT_FUNC | 1 << elf.STT_COMMON);
         const OK_BINDS = (1 << elf.STB_GLOBAL | 1 << elf.STB_WEAK | 1 << elf.STB_GNU_UNIQUE);
 
-        var i: usize = 0;
-        while (i < self.hashtab[1]) : (i += 1) {
-            if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[i].st_info & 0xf)) & OK_TYPES)) continue;
-            if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[i].st_info >> 4)) & OK_BINDS)) continue;
-            if (0 == self.syms[i].st_shndx) continue;
-            if (!mem.eql(u8, name, mem.sliceTo(self.strings + self.syms[i].st_name, 0))) continue;
-            if (maybe_versym) |versym| {
-                if (!checkver(self.verdef.?, versym[i], vername, self.strings))
-                    continue;
-            }
-            return @intFromPtr(self.memory.ptr) + self.syms[i].st_value;
-        }
+        switch (self.hashtab) {
+            .ELF => |hashtab| {
+                var i: usize = 0;
+                while (i < hashtab.chains.len) : (i += 1) {
+                    if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[i].st_info & 0xf)) & OK_TYPES)) continue;
+                    if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[i].st_info >> 4)) & OK_BINDS)) continue;
+                    if (0 == self.syms[i].st_shndx) continue;
+                    if (!mem.eql(u8, name, mem.sliceTo(self.strings + self.syms[i].st_name, 0))) continue;
+                    if (maybe_versym) |versym| {
+                        if (!checkver(self.verdef.?, versym[i], vername, self.strings))
+                            continue;
+                    }
+                    return @intFromPtr(self.memory.ptr) + self.syms[i].st_value;
+                }
 
-        return null;
+                return null;
+            },
+            .GNU => |hashtab| {
+                const name_hash = elfGnuHash(name);
+                var symdx = hashtab.buckets[name_hash % hashtab.buckets.len];
+                if (symdx < hashtab.sym_offset) {
+                    return null;
+                }
+                while (true) : (symdx += 1) {
+                    const sym_hash = hashtab.chain[symdx - hashtab.sym_offset];
+                    b: {
+                        if (name_hash | 1 != sym_hash | 1) break :b;
+                        if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[symdx].st_info & 0xf)) & OK_TYPES)) break :b;
+                        if (0 == (@as(u32, 1) << @as(u5, @intCast(self.syms[symdx].st_info >> 4)) & OK_BINDS)) break :b;
+                        if (!mem.eql(u8, name, mem.sliceTo(self.strings + self.syms[symdx].st_name, 0))) break :b;
+                        if (maybe_versym) |versym| {
+                            if (!checkver(self.verdef.?, versym[symdx], vername, self.strings)) break :b;
+                        }
+                        return @intFromPtr(self.memory.ptr) + self.syms[symdx].st_value;
+                    }
+                    if (sym_hash & 1 == 1) break;
+                }
+                return null;
+            },
+        }
     }
 
     fn elfToMmapProt(elf_prot: u64) u32 {
